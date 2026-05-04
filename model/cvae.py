@@ -25,7 +25,7 @@ For ICA:
   each c_ik inside stacked ICA → same encoder structure → e_ik
 
 Decoder:
-  [z_i || e_ik] → 64 × 8³ → 32 × 16³ → 16 × 32³ → 1 × 64³
+  [z_i || e_ik] → Linear+LeakyReLU → 64 × 8³ → 32 × 16³ → 16 × 32³ → 1 × 64³ (identity)
 
 Output:
   components : (B, 53, 64, 64, 64)
@@ -237,11 +237,11 @@ class StackComponentDecoder(nn.Module):
 
     Decode:
       [z_i || e_ik]
-          → Linear
-          → 64 × 8 × 8 × 8
-          → 32 × 16 × 16 × 16
-          → 16 × 32 × 32 × 32
-          → 1  × 64 × 64 × 64
+          → Linear + LeakyReLU  (projection to seed volume)
+          → reshape: 64 × 8 × 8 × 8       (f^(1))
+          → UpBlock_32: 32 × 16 × 16 × 16 (f^(2))
+          → UpBlock_16: 16 × 32 × 32 × 32 (f^(3))
+          → Upsample + Conv3d: 1 × 64 × 64 × 64 (f^(4), identity activation)
     """
 
     def __init__(
@@ -374,13 +374,18 @@ class C3DVAE(nn.Module):
         self,
         mu: torch.Tensor,
         logvar: torch.Tensor,
+        stochastic: bool = True,
     ) -> torch.Tensor:
         """
-        z = mu + sigma * eps
+        z = mu + sigma * eps   (stochastic=True, default)
+        z = mu                 (stochastic=False, for deterministic eval)
 
-        During evaluation, use deterministic z = mu.
+        Training always uses the stochastic path to keep the KL term
+        meaningful and to avoid posterior collapse.  At test time the
+        default is also stochastic; pass stochastic=False explicitly
+        when you want a single deterministic reconstruction.
         """
-        if self.training:
+        if stochastic:
             std = torch.exp(0.5 * logvar)
             eps = torch.randn_like(std)
             return mu + std * eps
@@ -422,9 +427,11 @@ class C3DVAE(nn.Module):
         assert smri.shape[1] == 1, \
             f"Expected smri channel dimension 1, got {smri.shape[1]}"
 
-        # 1. Encode sMRI and sample latent z
+        # 1. Encode sMRI and sample latent z.
+        # stochastic=self.training: sample during training (keeps KL meaningful),
+        # use z = mu deterministically during eval (stable, reproducible outputs).
         mu, logvar = self.smri_encoder(smri)
-        z = self.reparameterise(mu, logvar)                 # (B, latent_dim)
+        z = self.reparameterise(mu, logvar, stochastic=self.training)  # (B, latent_dim)
 
         # 2. Encode each ICA component inside the stack
         ica_flat = ica_stacked.reshape(B * K, 1, D, H, W)   # (B*K, 1, D, H, W)
@@ -455,22 +462,34 @@ class C3DVAE(nn.Module):
         self,
         smri: torch.Tensor,
         ica_stacked: torch.Tensor,
+        stochastic: bool = False,
     ) -> torch.Tensor:
         """
-        Deterministic inference.
+        Inference convenience wrapper.
+
+        stochastic=False (default): use z = mu for a single deterministic
+          reconstruction — useful for evaluation and visualisation.
+        stochastic=True: sample z ~ q(z|X) for probabilistic generation
+          of novel structural components.
 
         returns:
           components : (B, K, 64, 64, 64)
         """
-        was_training = self.training
-        self.eval()
+        mu, logvar = self.smri_encoder(smri)
+        z = self.reparameterise(mu, logvar, stochastic=stochastic)
 
-        out = self.forward(smri, ica_stacked)["components"]
+        B, K, D, H, W = ica_stacked.shape
+        ica_flat = ica_stacked.reshape(B * K, 1, D, H, W)
+        e_flat = self.ica_encoder(ica_flat)
 
-        if was_training:
-            self.train()
+        z_flat = (
+            z.unsqueeze(1)
+             .expand(B, K, self.latent_dim)
+             .reshape(B * K, self.latent_dim)
+        )
 
-        return out
+        comp_flat = self.decoder(z_flat, e_flat)
+        return comp_flat.reshape(B, K, D, H, W)
 
     def __str__(self) -> str:
         params = sum(p.numel() for p in self.parameters() if p.requires_grad)

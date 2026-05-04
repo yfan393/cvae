@@ -68,13 +68,27 @@ def run_forward(
             idx = torch.randperm(B, device=device)
             c_in = c[idx]
 
+        elif ica_mode == "perm_eval":
+            # Ablation 4: the model forward pass uses the *correct* ICA maps
+            # (c_in = c).  The permutation is applied only to the evaluation
+            # pairing below, after inference.  This branch is intentionally
+            # the same as "normal" for the forward pass — the scrambling
+            # happens at metric-computation time so that any drop in PC/MI
+            # reveals whether components are specifically tied to their ICA maps.
+            c_in = c
+
         else:
+            # "normal" mode: correct ICA conditioning, correct eval pairing.
             c_in = c
 
         out = model(s, c_in)
         comps = out["components"]
 
         if ica_mode == "perm_eval":
+            # Scramble the component→ICA assignment used for metric computation.
+            # Generated component k is evaluated against ICA map idx[k],
+            # breaking the correct pairing; any drop in PC/MI is attributable
+            # to the ICA conditioning signal driving spatial specificity.
             idx = torch.randperm(c.size(1), device=device)
             c_eval = c[:, idx, ...]
         else:
