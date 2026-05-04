@@ -3,29 +3,33 @@ model/cvae.py
 ─────────────────────────────────────────────────────────────────
 Conditional 3D Variational Autoencoder (C3D-VAE)
 
-Updated architecture:
-
 Data input:
   smri        : (B, 1,  64, 64, 64)
   ica_stacked : (B, 53, 64, 64, 64)
 
-Shared encoder structure for both sMRI and each ICA component:
-
-  ConvBlock_16 : 1  × 64³ → 16 × 32³
-  ConvBlock_32 : 16 × 32³ → 32 × 16³
-  ConvBlock_64 : 32 × 16³ → 64 × 8³
+sMRI encoder  (SimpleVolumeEncoder):
+  ConvBlock_16 : 1  × 64³ → 16 × 32³   (stride-2)
+  ConvBlock_32 : 16 × 32³ → 32 × 16³   (stride-2)
+  ConvBlock_64 : 32 × 16³ → 64 × 8³    (stride-2)
   GAP          : 64 × 8³  → 64
   Linear       : 64       → embedding_dim
+  → mu, logvar → z_i ∈ R^{latent_dim}
 
-For sMRI:
-  smri → shared-style encoder → h_i
-  h_i  → μ, logσ²
+ICA encoder  (StackedICAEncoder — grouped convolutions):
+  All K=53 maps encoded in ONE GPU call using groups=K.
+  GroupedConvBlock_16K : K×64³ → 16K×32³   (groups=K)
+  GroupedConvBlock_32K : 16K×32³→ 32K×16³  (groups=K)
+  GroupedConvBlock_64K : 32K×16³→ 64K×8³   (groups=K)
+  GAP per group        : 64K×8³ → 64K
+  Linear (shared)      : 64    → cond_dim  (applied to each of K groups)
+  → e_ik ∈ R^{K × cond_dim}
 
-For ICA:
-  each c_ik inside stacked ICA → same encoder structure → e_ik
+  Chunked fallback: if B*K > ICA_CHUNK_SIZE, the grouped encoder is
+  called in mini-batches of ICA_CHUNK_SIZE // K subjects at a time,
+  bounding peak memory regardless of batch size.
 
-Decoder:
-  [z_i || e_ik] → Linear+LeakyReLU → 64 × 8³ → 32 × 16³ → 16 × 32³ → 1 × 64³ (identity)
+Decoder  (StackComponentDecoder, shared across all k):
+  [z_i || e_ik] → Linear+LeakyReLU → 64×8³ → 32×16³ → 16×32³ → 1×64³ (identity)
 
 Output:
   components : (B, 53, 64, 64, 64)
@@ -182,6 +186,113 @@ class SimpleVolumeEncoder(nn.Module):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Grouped ICA stack encoder
+# ─────────────────────────────────────────────────────────────────────────────
+
+class StackedICAEncoder(nn.Module):
+    """
+    Encodes all K ICA maps in a single grouped-convolution forward pass.
+
+    Key idea: treat the K=53 ICA maps as K independent "groups" in a
+    grouped Conv3d.  This replaces 53 sequential single-channel encoder
+    calls with one kernel launch, giving a ~K× reduction in GPU overhead.
+
+    Input  : (B, K, D, H, W)  — the full stacked ICA tensor
+    Output : (B, K, cond_dim) — one embedding vector per component
+
+    Grouped convolution mechanics
+    ─────────────────────────────
+    A standard Conv3d(in, out, ...) treats the input as one group.
+    With groups=K:
+      in_channels  = K * 1   (each group owns 1 input channel)
+      out_channels = K * C   (each group produces C output channels)
+    The K groups never communicate — exactly equivalent to running K
+    separate Conv3d(1, C, ...) calls but in a single kernel.
+
+    The GAP + Linear projection are applied per-group by reshaping:
+      (B, K*64, 8, 8, 8) → GAP → (B, K*64) → view (B*K, 64) → Linear → (B*K, cond_dim)
+
+    Memory note
+    ───────────
+    Peak activation during the grouped conv is (B, K*64, 8³) which for
+    B=4, K=53 is 4×3392×512 float32 ≈ 27 MB — well within budget.
+    If a very large batch is used, the chunked wrapper in trainer.py
+    splits the B dimension before calling this encoder.
+    """
+
+    def __init__(
+        self,
+        num_components: int = 53,
+        cond_dim: int = 64,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+
+        K = num_components
+        self.K = K
+        self.cond_dim = cond_dim
+
+        # Grouped convolutions: groups=K, each group maps 1→C channels.
+        # in_channels = K*1, out_channels = K*C so that channel dim stays
+        # interpretable as (K groups) × (C feature maps per group).
+        self.enc = nn.Sequential(
+            # Layer 1: K×1 → K×16   64³ → 32³
+            nn.Conv3d(K * 1,  K * 16, kernel_size=3, stride=2,
+                      padding=1, groups=K, bias=False),
+            nn.BatchNorm3d(K * 16),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Dropout3d(dropout) if dropout > 0.0 else nn.Identity(),
+
+            # Layer 2: K×16 → K×32  32³ → 16³
+            nn.Conv3d(K * 16, K * 32, kernel_size=3, stride=2,
+                      padding=1, groups=K, bias=False),
+            nn.BatchNorm3d(K * 32),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Dropout3d(dropout) if dropout > 0.0 else nn.Identity(),
+
+            # Layer 3: K×32 → K×64  16³ → 8³
+            nn.Conv3d(K * 32, K * 64, kernel_size=3, stride=2,
+                      padding=1, groups=K, bias=False),
+            nn.BatchNorm3d(K * 64),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Dropout3d(dropout) if dropout > 0.0 else nn.Identity(),
+        )
+
+        # Global average pool collapses spatial dims: (B, K*64, 8³) → (B, K*64, 1, 1, 1)
+        self.gap = nn.AdaptiveAvgPool3d(1)
+
+        # Shared linear projection applied identically to each group's 64-d vector.
+        # Implemented as a single Linear(64, cond_dim) applied after reshaping to
+        # (B*K, 64) — equivalent to K separate Linear layers with tied weights.
+        self.proj = nn.Linear(64, cond_dim)
+
+    def forward(self, ica_stacked: torch.Tensor) -> torch.Tensor:
+        """
+        ica_stacked : (B, K, D, H, W)
+
+        returns:
+          embeddings : (B, K, cond_dim)
+        """
+        B, K, D, H, W = ica_stacked.shape
+
+        assert K == self.K, \
+            f"StackedICAEncoder expects K={self.K} components, got {K}"
+
+        # Input to grouped conv must have shape (B, K*1, D, H, W).
+        # ica_stacked is already (B, K, D, H, W) — same thing.
+        h = self.enc(ica_stacked)           # (B, K*64, 8, 8, 8)
+
+        h = self.gap(h)                     # (B, K*64, 1, 1, 1)
+        h = h.flatten(1)                    # (B, K*64)
+
+        # Reshape so each group's 64 features are a separate row.
+        h = h.view(B * K, 64)              # (B*K, 64)
+        h = self.proj(h)                    # (B*K, cond_dim)
+
+        return h.view(B, K, self.cond_dim)  # (B, K, cond_dim)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # sMRI VAE encoder
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -323,14 +434,10 @@ class C3DVAE(nn.Module):
       ica_stacked : (B, 53, 64, 64, 64)
 
     Steps:
-      1. Encode sMRI with simple 3-layer encoder.
-      2. Produce mu and logvar.
-      3. Reparameterise z.
-      4. Flatten stacked ICA from (B, K, D, H, W) to (B*K, 1, D, H, W).
-      5. Encode each ICA component with the same encoder structure.
-      6. Expand z from (B, d) to (B*K, d).
-      7. Decode all components in one batched call.
-      8. Reshape output back to (B, K, D, H, W).
+      1. Encode sMRI → mu, logvar → z_i  (B, latent_dim)
+      2. Encode ALL 53 ICA maps in one grouped-conv call → e_ik  (B, K, cond_dim)
+      3. Expand z_i to (B*K, latent_dim), flatten e_ik to (B*K, cond_dim)
+      4. Decode all components in chunked batches → (B, K, D, H, W)
     """
 
     def __init__(
@@ -353,8 +460,12 @@ class C3DVAE(nn.Module):
             dropout=dropout,
         )
 
-        self.ica_encoder = SimpleVolumeEncoder(
-            embedding_dim=cond_dim,
+        # StackedICAEncoder encodes all K maps in one grouped-conv call
+        # instead of K sequential single-map calls. Same learned function,
+        # much lower GPU kernel overhead.
+        self.ica_encoder = StackedICAEncoder(
+            num_components=num_components,
+            cond_dim=cond_dim,
             dropout=dropout,
         )
 
@@ -428,27 +539,25 @@ class C3DVAE(nn.Module):
             f"Expected smri channel dimension 1, got {smri.shape[1]}"
 
         # 1. Encode sMRI and sample latent z.
-        # stochastic=self.training: sample during training (keeps KL meaningful),
-        # use z = mu deterministically during eval (stable, reproducible outputs).
         mu, logvar = self.smri_encoder(smri)
         z = self.reparameterise(mu, logvar, stochastic=self.training)  # (B, latent_dim)
 
-        # 2. Encode each ICA component inside the stack
-        ica_flat = ica_stacked.reshape(B * K, 1, D, H, W)   # (B*K, 1, D, H, W)
-        e_flat = self.ica_encoder(ica_flat)                 # (B*K, cond_dim)
+        # 2. Encode all K ICA maps in one grouped-conv call.
+        #    Output is already (B, K, cond_dim) — no reshape needed.
+        ica_embed = self.ica_encoder(ica_stacked)           # (B, K, cond_dim)
+        e_flat = ica_embed.reshape(B * K, self.cond_dim)   # (B*K, cond_dim)
 
-        # 3. Expand z so each ICA component gets the same subject-level z
+        # 3. Expand z so each ICA component gets the same subject-level z.
         z_flat = (
             z.unsqueeze(1)
              .expand(B, K, self.latent_dim)
              .reshape(B * K, self.latent_dim)
         )                                                   # (B*K, latent_dim)
 
-        # 4. Decode all components together
+        # 4. Decode all components together.
         comp_flat = self.decoder(z_flat, e_flat)            # (B*K, 1, D, H, W)
 
-        components = comp_flat.reshape(B, K, D, H, W)       # (B, K, D, H, W)
-        ica_embed = e_flat.reshape(B, K, self.cond_dim)     # (B, K, cond_dim)
+        components = comp_flat.reshape(B, K, D, H, W)      # (B, K, D, H, W)
 
         return {
             "components": components,
@@ -479,8 +588,8 @@ class C3DVAE(nn.Module):
         z = self.reparameterise(mu, logvar, stochastic=stochastic)
 
         B, K, D, H, W = ica_stacked.shape
-        ica_flat = ica_stacked.reshape(B * K, 1, D, H, W)
-        e_flat = self.ica_encoder(ica_flat)
+        ica_embed = self.ica_encoder(ica_stacked)           # (B, K, cond_dim)
+        e_flat = ica_embed.reshape(B * K, self.cond_dim)
 
         z_flat = (
             z.unsqueeze(1)

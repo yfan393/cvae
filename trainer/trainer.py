@@ -29,7 +29,8 @@ from .loss import CVAELoss
 from utils.model_utils import is_bad
 
 
-CHUNK_SIZE = 32
+CHUNK_SIZE = 32          # decoder chunks: number of (subject, component) pairs per pass
+ICA_CHUNK_SIZE = 4       # ICA encoder chunks: number of subjects per grouped-conv call
 
 
 def _forward_chunked(
@@ -38,42 +39,60 @@ def _forward_chunked(
     ica_stacked: torch.Tensor,
 ) -> dict:
     """
-    Chunked forward pass.
+    Memory-efficient forward pass with two levels of chunking:
 
-    smri:
-      (B, 1, 64, 64, 64)
+    1. ICA encoder chunking (subject dimension):
+       StackedICAEncoder processes ICA_CHUNK_SIZE subjects at a time.
+       Each call encodes K=53 maps via grouped convolutions → (chunk, K, cond_dim).
+       This bounds the grouped-conv activation memory regardless of batch size.
 
-    ica_stacked:
-      (B, K, 64, 64, 64)
+    2. Decoder chunking (subject×component dimension):
+       The decoder processes CHUNK_SIZE (subject, component) pairs at a time.
+       This was already present and is unchanged.
+
+    smri        : (B, 1,  64, 64, 64)
+    ica_stacked : (B, K, 64, 64, 64)
     """
     B, K, D, H, W = ica_stacked.shape
 
+    # ── Step 1: sMRI encoder (runs on full batch — small compared to ICA) ────
     mu, logvar = model.smri_encoder(smri)
-    z = model.reparameterise(mu, logvar)
+    z = model.reparameterise(mu, logvar)                # (B, latent_dim)
 
-    ica_flat = ica_stacked.reshape(B * K, 1, D, H, W)
-    e_flat = model.ica_encoder(ica_flat)
+    # ── Step 2: ICA encoder — chunked over subjects ───────────────────────────
+    # StackedICAEncoder takes (chunk_B, K, D, H, W) and returns
+    # (chunk_B, K, cond_dim) in one grouped-conv call per chunk.
+    ica_embed_chunks = []
+    for s in range(0, B, ICA_CHUNK_SIZE):
+        e = min(s + ICA_CHUNK_SIZE, B)
+        ica_embed_chunks.append(
+            model.ica_encoder(ica_stacked[s:e])         # (chunk, K, cond_dim)
+        )
+    ica_embed = torch.cat(ica_embed_chunks, dim=0)      # (B, K, cond_dim)
 
+    e_flat = ica_embed.reshape(B * K, model.cond_dim)   # (B*K, cond_dim)
+
+    # ── Step 3: expand z to (B*K, latent_dim) ────────────────────────────────
     z_flat = (
         z.unsqueeze(1)
          .expand(B, K, model.latent_dim)
          .reshape(B * K, model.latent_dim)
     )
 
-    chunks = []
+    # ── Step 4: decoder — chunked over (subject × component) pairs ───────────
+    dec_chunks = []
     for start in range(0, B * K, CHUNK_SIZE):
         end = min(start + CHUNK_SIZE, B * K)
-        chunk = model.decoder(z_flat[start:end], e_flat[start:end])
-        chunks.append(chunk)
+        dec_chunks.append(model.decoder(z_flat[start:end], e_flat[start:end]))
 
-    comp_flat = torch.cat(chunks, dim=0)
-    components = comp_flat.reshape(B, K, D, H, W)
+    comp_flat = torch.cat(dec_chunks, dim=0)            # (B*K, 1, D, H, W)
+    components = comp_flat.reshape(B, K, D, H, W)      # (B, K, D, H, W)
 
     return {
         "components": components,
         "mu": mu,
         "logvar": logvar,
-        "ica_embed": e_flat.reshape(B, K, model.cond_dim),
+        "ica_embed": ica_embed,
     }
 
 
