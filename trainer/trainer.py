@@ -29,7 +29,7 @@ from .loss import CVAELoss
 from utils.model_utils import is_bad
 
 
-CHUNK_SIZE = 32          # decoder chunks: (subject × component) pairs per pass
+CHUNK_SIZE = 32
 
 
 def _forward_chunked(
@@ -38,39 +38,36 @@ def _forward_chunked(
     ica_stacked: torch.Tensor,
 ) -> dict:
     """
-    Memory-efficient forward pass.
+    Chunked forward pass.
 
-    The decoder is chunked over CHUNK_SIZE (subject × component) pairs at
-    a time to bound peak VRAM during the upsampling path.
+    smri:
+      (B, 1, 64, 64, 64)
 
-    smri        : (B, 1,  64, 64, 64)
-    ica_stacked : (B, K, 64, 64, 64)
+    ica_stacked:
+      (B, K, 64, 64, 64)
     """
     B, K, D, H, W = ica_stacked.shape
 
-    # ── sMRI encoder ─────────────────────────────────────────────────────────
     mu, logvar = model.smri_encoder(smri)
-    z = model.reparameterise(mu, logvar)                # (B, latent_dim)
+    z = model.reparameterise(mu, logvar)
 
-    # ── ICA encoder ──────────────────────────────────────────────────────────
-    ica_flat = ica_stacked.reshape(B * K, 1, D, H, W)  # (B*K, 1, D, H, W)
-    e_flat = model.ica_encoder(ica_flat)                # (B*K, cond_dim)
+    ica_flat = ica_stacked.reshape(B * K, 1, D, H, W)
+    e_flat = model.ica_encoder(ica_flat)
 
-    # ── Expand z ─────────────────────────────────────────────────────────────
     z_flat = (
         z.unsqueeze(1)
          .expand(B, K, model.latent_dim)
          .reshape(B * K, model.latent_dim)
-    )                                                   # (B*K, latent_dim)
+    )
 
-    # ── Decoder — chunked over (subject × component) pairs ───────────────────
     chunks = []
     for start in range(0, B * K, CHUNK_SIZE):
         end = min(start + CHUNK_SIZE, B * K)
-        chunks.append(model.decoder(z_flat[start:end], e_flat[start:end]))
+        chunk = model.decoder(z_flat[start:end], e_flat[start:end])
+        chunks.append(chunk)
 
-    comp_flat = torch.cat(chunks, dim=0)                # (B*K, 1, D, H, W)
-    components = comp_flat.reshape(B, K, D, H, W)      # (B, K, D, H, W)
+    comp_flat = torch.cat(chunks, dim=0)
+    components = comp_flat.reshape(B, K, D, H, W)
 
     return {
         "components": components,
