@@ -31,13 +31,6 @@ from nilearn.image import resample_to_img
 
 CSV_PATH = Path(__file__).parent / 'ukbb.csv'
 
-# Preprocessed tensor cache directory.
-# Set to None to disable caching (e.g. when storage is limited).
-# When set, _load() saves (smri, ica_stacked) as subject_<id>.pt on first
-# access and reads from disk on all subsequent runs — skipping the expensive
-# NIfTI load + nilearn resample step entirely.
-CACHE_DIR = Path(__file__).parent / 'tensor_cache'
-
 # Set True to load all subjects at __init__ time (small datasets / ablations)
 PRELOAD = False
 
@@ -163,38 +156,19 @@ class UKBBData(Dataset):
 
     def _load(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Load one subject, using a disk cache to skip the expensive NIfTI
-        load + nilearn resample on all runs after the first.
-
-        Cache layout:  CACHE_DIR/subject_<id>.pt  →  (smri, ica_stacked)
-
-        First access: load from NIfTI → preprocess → save .pt
-        Subsequent:   torch.load .pt directly  (no NIfTI, no resample)
+        Load, resample, pad, and mask one subject from disk.
 
         Returns
         -------
-        smri        : (1,  64, 64, 64) float32
-        ica_stacked : (53, 64, 64, 64) float32
+        smri : torch.Tensor
+            Shape (1, 64, 64, 64), float32.
+
+        ica_stacked : torch.Tensor
+            Shape (53, 64, 64, 64), float32.
         """
         row = self.df.iloc[idx]
-        subject_id = row['subject_id']
 
-        # ── Try cache first ───────────────────────────────────────────────────
-        if CACHE_DIR is not None:
-            CACHE_DIR.mkdir(parents=True, exist_ok=True)
-            cache_path = CACHE_DIR / f"subject_{subject_id}.pt"
-
-            if cache_path.exists():
-                smri_t, ica_stacked = torch.load(
-                    cache_path,
-                    map_location="cpu",
-                    weights_only=True,
-                )
-                return smri_t, ica_stacked
-
-        # ── Cache miss: load and preprocess from NIfTI ────────────────────────
-
-        # ICA: raw shape (x, y, z, 53) → (53, x, y, z)
+        # ── ICA ───────────────────────────────────────────────────────────────
         ica_img = nb.load(row['ica_path'])
         ica_np = ica_img.get_fdata(dtype=np.float32)              # (x,y,z,53)
         ica_np = np.ascontiguousarray(np.moveaxis(ica_np, -1, 0)) # (53,x,y,z)
@@ -205,7 +179,7 @@ class UKBBData(Dataset):
         # Suppress noise: voxels with |Z| < 0.2 carry no meaningful signal.
         ica_stacked = ica_stacked * (ica_stacked.abs() > ICA_THRESHOLD)
 
-        # sMRI: resample 1mm → ICA grid (~3mm), then pad
+        # ── sMRI ──────────────────────────────────────────────────────────────
         smri_img = nb.load(row['smri_path'])
         smri_img = resample_to_img(
             smri_img,
@@ -218,10 +192,6 @@ class UKBBData(Dataset):
         smri_t = self._pad(
             torch.from_numpy(smri_np).unsqueeze(0)
         )                                                          # (1,64,64,64)
-
-        # ── Write cache ───────────────────────────────────────────────────────
-        if CACHE_DIR is not None:
-            torch.save((smri_t, ica_stacked), cache_path)
 
         return smri_t, ica_stacked
 
