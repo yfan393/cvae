@@ -21,8 +21,8 @@
 
     "loss_weights": {
         "lambda1":       1.0,
-        "lambda2":       0.5,
-        "lambda3":       0.1,
+        "lambda2":       0.1,
+        "lambda3":       0.5,
         "lambda4":       0.001,
         "warmup_epochs": 2
     }
