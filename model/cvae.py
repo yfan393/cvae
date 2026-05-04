@@ -3,28 +3,29 @@ model/cvae.py
 ─────────────────────────────────────────────────────────────────
 Conditional 3D Variational Autoencoder (C3D-VAE)
 
+Updated architecture:
+
 Data input:
   smri        : (B, 1,  64, 64, 64)
   ica_stacked : (B, 53, 64, 64, 64)
 
-sMRI encoder  (SimpleVolumeEncoder):
-  ConvBlock_16 : 1  × 64³ → 16 × 32³   (stride-2)
-  ConvBlock_32 : 16 × 32³ → 32 × 16³   (stride-2)
-  ConvBlock_64 : 32 × 16³ → 64 × 8³    (stride-2)
+Shared encoder structure for both sMRI and each ICA component:
+
+  ConvBlock_16 : 1  × 64³ → 16 × 32³
+  ConvBlock_32 : 16 × 32³ → 32 × 16³
+  ConvBlock_64 : 32 × 16³ → 64 × 8³
   GAP          : 64 × 8³  → 64
   Linear       : 64       → embedding_dim
-  → mu, logvar → z_i ∈ R^{latent_dim}
 
-ICA encoder  (SimpleVolumeEncoder, shared weights):
-  ica_stacked (B, K, 64³) → reshape (B*K, 1, 64³)
-  ConvBlock_16 : 1  × 64³ → 16 × 32³   (stride-2)
-  ConvBlock_32 : 16 × 32³ → 32 × 16³   (stride-2)
-  ConvBlock_64 : 32 × 16³ → 64 × 8³    (stride-2)
-  GAP + Linear : 64 × 8³  → cond_dim
-  → e_ik ∈ R^{cond_dim}, reshaped to (B, K, cond_dim)
+For sMRI:
+  smri → shared-style encoder → h_i
+  h_i  → μ, logσ²
 
-Decoder  (StackComponentDecoder, shared across all k):
-  [z_i || e_ik] → Linear+LeakyReLU → 64×8³ → 32×16³ → 16×32³ → 1×64³ (identity)
+For ICA:
+  each c_ik inside stacked ICA → same encoder structure → e_ik
+
+Decoder:
+  [z_i || e_ik] → Linear+LeakyReLU → 64 × 8³ → 32 × 16³ → 16 × 32³ → 1 × 64³ (identity)
 
 Output:
   components : (B, 53, 64, 64, 64)
@@ -181,10 +182,6 @@ class SimpleVolumeEncoder(nn.Module):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Grouped ICA stack encoder
-# ─────────────────────────────────────────────────────────────────────────────
-
-# ─────────────────────────────────────────────────────────────────────────────
 # sMRI VAE encoder
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -326,11 +323,14 @@ class C3DVAE(nn.Module):
       ica_stacked : (B, 53, 64, 64, 64)
 
     Steps:
-      1. Encode sMRI → mu, logvar → z_i            (B, latent_dim)
-      2. Reshape ICA stack to (B*K, 1, D, H, W),
-         encode with shared SimpleVolumeEncoder → e_ik  (B*K, cond_dim)
-      3. Expand z_i to (B*K, latent_dim)
-      4. Decode all components in chunked batches → (B, K, D, H, W)
+      1. Encode sMRI with simple 3-layer encoder.
+      2. Produce mu and logvar.
+      3. Reparameterise z.
+      4. Flatten stacked ICA from (B, K, D, H, W) to (B*K, 1, D, H, W).
+      5. Encode each ICA component with the same encoder structure.
+      6. Expand z from (B, d) to (B*K, d).
+      7. Decode all components in one batched call.
+      8. Reshape output back to (B, K, D, H, W).
     """
 
     def __init__(
@@ -374,13 +374,18 @@ class C3DVAE(nn.Module):
         self,
         mu: torch.Tensor,
         logvar: torch.Tensor,
+        stochastic: bool = True,
     ) -> torch.Tensor:
         """
-        z = mu + sigma * eps
+        z = mu + sigma * eps   (stochastic=True, default)
+        z = mu                 (stochastic=False, for deterministic eval)
 
-        During evaluation, use deterministic z = mu.
+        Training always uses the stochastic path to keep the KL term
+        meaningful and to avoid posterior collapse.  At test time the
+        default is also stochastic; pass stochastic=False explicitly
+        when you want a single deterministic reconstruction.
         """
-        if self.training:
+        if stochastic:
             std = torch.exp(0.5 * logvar)
             eps = torch.randn_like(std)
             return mu + std * eps
@@ -423,23 +428,24 @@ class C3DVAE(nn.Module):
             f"Expected smri channel dimension 1, got {smri.shape[1]}"
 
         # 1. Encode sMRI and sample latent z.
+        # stochastic=self.training: sample during training (keeps KL meaningful),
+        # use z = mu deterministically during eval (stable, reproducible outputs).
         mu, logvar = self.smri_encoder(smri)
-        z = self.reparameterise(mu, logvar)              # (B, latent_dim)
+        z = self.reparameterise(mu, logvar, stochastic=self.training)  # (B, latent_dim)
 
-        # 2. Encode each ICA component: flatten stack to (B*K, 1, D, H, W),
-        #    run shared encoder, reshape back.
+        # 2. Encode each ICA component inside the stack
         ica_flat = ica_stacked.reshape(B * K, 1, D, H, W)   # (B*K, 1, D, H, W)
-        e_flat = self.ica_encoder(ica_flat)                  # (B*K, cond_dim)
+        e_flat = self.ica_encoder(ica_flat)                 # (B*K, cond_dim)
 
-        # 3. Expand z so each ICA component gets the same subject-level z.
+        # 3. Expand z so each ICA component gets the same subject-level z
         z_flat = (
             z.unsqueeze(1)
              .expand(B, K, self.latent_dim)
              .reshape(B * K, self.latent_dim)
-        )                                                    # (B*K, latent_dim)
+        )                                                   # (B*K, latent_dim)
 
-        # 4. Decode all components together.
-        comp_flat = self.decoder(z_flat, e_flat)             # (B*K, 1, D, H, W)
+        # 4. Decode all components together
+        comp_flat = self.decoder(z_flat, e_flat)            # (B*K, 1, D, H, W)
 
         components = comp_flat.reshape(B, K, D, H, W)       # (B, K, D, H, W)
         ica_embed = e_flat.reshape(B, K, self.cond_dim)     # (B, K, cond_dim)
@@ -456,22 +462,34 @@ class C3DVAE(nn.Module):
         self,
         smri: torch.Tensor,
         ica_stacked: torch.Tensor,
+        stochastic: bool = False,
     ) -> torch.Tensor:
         """
-        Deterministic inference.
+        Inference convenience wrapper.
+
+        stochastic=False (default): use z = mu for a single deterministic
+          reconstruction — useful for evaluation and visualisation.
+        stochastic=True: sample z ~ q(z|X) for probabilistic generation
+          of novel structural components.
 
         returns:
           components : (B, K, 64, 64, 64)
         """
-        was_training = self.training
-        self.eval()
+        mu, logvar = self.smri_encoder(smri)
+        z = self.reparameterise(mu, logvar, stochastic=stochastic)
 
-        out = self.forward(smri, ica_stacked)["components"]
+        B, K, D, H, W = ica_stacked.shape
+        ica_flat = ica_stacked.reshape(B * K, 1, D, H, W)
+        e_flat = self.ica_encoder(ica_flat)
 
-        if was_training:
-            self.train()
+        z_flat = (
+            z.unsqueeze(1)
+             .expand(B, K, self.latent_dim)
+             .reshape(B * K, self.latent_dim)
+        )
 
-        return out
+        comp_flat = self.decoder(z_flat, e_flat)
+        return comp_flat.reshape(B, K, D, H, W)
 
     def __str__(self) -> str:
         params = sum(p.numel() for p in self.parameters() if p.requires_grad)
