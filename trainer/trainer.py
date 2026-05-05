@@ -29,7 +29,7 @@ from .loss import CVAELoss
 from utils.model_utils import is_bad
 
 
-CHUNK_SIZE = 32
+CHUNK_SIZE = 53
 
 
 def _forward_chunked(
@@ -366,9 +366,9 @@ class CVAETrainer:
                 last_comps = comps.detach()
 
                 # Optional lightweight visualization:
-                # if not vis_done and epoch % self.vis_every == 0:
-                #     self._visualise_light(s, c, comps, rho, epoch)
-                #     vis_done = True
+                if not vis_done and epoch % self.vis_every == 0:
+                    self._visualise_light(s, c, comps, rho, epoch)
+                    vis_done = True
 
         if last_comps is not None:
             comp_std = last_comps.std(dim=1).mean().item()
