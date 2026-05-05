@@ -66,10 +66,10 @@ def run_inference(model, loader, device, mean, use_amp=True):
             out = model(s, c)
             comps = out["components"]
 
-        smri_l.append(s.cpu())
-        comp_l.append(comps.cpu())
-        ica_l.append(c.cpu())
-        mu_l.append(out["mu"].cpu())
+        smri_l.append(s.cpu().float())
+        comp_l.append(comps.cpu().float())
+        ica_l.append(c.cpu().float())
+        mu_l.append(out["mu"].cpu().float())
 
     return (
         torch.cat(smri_l),
@@ -79,7 +79,7 @@ def run_inference(model, loader, device, mean, use_amp=True):
     )
 
 
-def report_metrics(smri_all, comps_all, ica_all, mask, save_dir):
+def report_metrics(smri_all, comps_all, ica_all, mask, save_dir, compute_mi=True):
     N = smri_all.size(0)
 
     m = compute_all_metrics(
@@ -87,7 +87,7 @@ def report_metrics(smri_all, comps_all, ica_all, mask, save_dir):
         components=comps_all,
         ica_stacked=ica_all,
         mask=mask,
-        compute_mi_flag=True,
+        compute_mi_flag=compute_mi,
     )
 
     isc, isc_k = compute_isc(comps_all)
@@ -347,6 +347,8 @@ def main():
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--vis_subjects", type=int, default=3)
     parser.add_argument("--no_amp", action="store_true")
+    parser.add_argument("--no_mi", action="store_true",
+                        help="Skip mutual information computation (faster)")
     args = parser.parse_args()
 
     save_dir = Path(args.save_dir)
@@ -402,6 +404,7 @@ def main():
         ica_all=ica_all,
         mask=mask_all,
         save_dir=save_dir,
+        compute_mi=not args.no_mi,
     )
 
     print("\nGenerating plots ...")

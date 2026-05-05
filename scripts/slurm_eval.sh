@@ -40,10 +40,11 @@ CHECKPOINT=saved/C3DVAE/model_best.pth
 # ── 1. Full test-set evaluation ───────────────────────────────────────────────
 echo "=== Evaluation ==="
 python evaluate/evaluate.py \
-    --checkpoint   "$CHECKPOINT" \
+    --checkpoint "$CHECKPOINT" \
     --num_subjects 20 \
     --vis_subjects 3 \
-    --save_dir     eval_results/
+    --save_dir eval_results/ \
+    --no_mi
 
 # ── 2. All ablation studies ───────────────────────────────────────────────────
 echo "=== Ablations ==="
