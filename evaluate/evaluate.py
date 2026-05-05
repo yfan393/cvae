@@ -416,7 +416,6 @@ def main():
     plot_latent_pca(mu_all, save_dir)
 
     mask_np = mask_all[0, 0].numpy().astype(bool)
-    n_vis = min(args.vis_subjects, smri_all.size(0))
 
     
     plot_reconstruction(
