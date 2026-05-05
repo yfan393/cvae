@@ -49,6 +49,8 @@ def run_forward(
 ) -> tuple:
     smri_l, comp_l, ica_l = [], [], []
 
+    model.eval()
+
     for smri, ica_stacked in loader:
         B = smri.size(0)
 
@@ -429,7 +431,7 @@ def main():
 
     loader = make_loader(args.num_subjects, args.batch_size)
 
-    train_ds = UKBBData(split="train", num_subjects=50)
+    train_ds = UKBBData(split="train", num_subjects=args.num_subjects)
     mean = train_ds.train_smri_mean.to(device)
 
     if train_ds.global_mask is not None:

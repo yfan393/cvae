@@ -29,7 +29,7 @@ cvae-main/
 │
 ├── trainer/
 │   ├── loss.py                     Four-term training objective (ELBO variant)
-│   ├── metric.py                   Evaluation metrics (RECON, PC, MI, ISC)
+│   ├── metric.py                   Evaluation metrics (RECON, PC, ISC)
 │   └── trainer.py                  CVAETrainer with chunked forward pass, monitoring
 │
 ├── data_loader/
@@ -214,8 +214,6 @@ mask, preventing wasted capacity on background zeros.
 | RECON    | ↓         | ≤ 0.10                                 |
 | PC       | ↑         | > 0.25 (significance)                  |
 | PC_025   | ↑         | > 0.62                                 |
-| MI       | ↑         | > 0.20                                 |
-| MI_02    | ↑         | > 0.62                                 |
 | ISC      | ↑         | > 0.50                                 |
 
 ---
@@ -289,5 +287,5 @@ bounds peak memory while preserving correct gradients.
 **Ablation 4 — permuted component assignment**
 The model forward pass uses the *correct* ICA conditioning. Only the
 evaluation pairing (which generated component is scored against which ICA map)
-is permuted. A drop in PC/MI confirms the ICA conditioning drives spatial
+is permuted. A drop in PC confirms the ICA conditioning drives spatial
 specificity, not the latent code alone.

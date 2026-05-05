@@ -48,6 +48,8 @@ def run_inference(model, loader, device, mean, use_amp=True):
 
     smri_l, comp_l, ica_l, mu_l = [], [], [], []
 
+    model.eval()
+
     for smri, ica_stacked in loader:
         B = smri.size(0)
 

@@ -110,7 +110,7 @@ def main():
         device=device,
         train_loader=train_ukbb.loader,
         valid_loader=valid_ukbb.loader,
-        num_epochs=tr_cfg.get("epochs", 200),
+        num_epochs=tr_cfg.get("epochs", 50),
         lambda1=lw.get("lambda1", 1.0),
         lambda2=lw.get("lambda2", 0.5),
         lambda3=lw.get("lambda3", 0.1),
