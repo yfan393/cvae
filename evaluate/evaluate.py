@@ -418,23 +418,22 @@ def main():
     mask_np = mask_all[0, 0].numpy().astype(bool)
     n_vis = min(args.vis_subjects, smri_all.size(0))
 
-    for s in range(n_vis):
-        plot_reconstruction(
-            smri_all[s, 0].numpy(),
-            comps_all[s].sum(dim=0).numpy(),
-            mask_np,
-            save_dir,
-            s,
-        )
+    
+    plot_reconstruction(
+        smri_all[0, 0].numpy(),
+        comps_all[0].sum(dim=0).numpy(),
+        mask_np,
+        save_dir,
+        0)
 
-        plot_all_components(
-            comps_all,
-            ica_all,
-            mask_np,
-            m["rho"],
-            save_dir,
-            s,
-        )
+    plot_all_components(
+        comps_all,
+        ica_all,
+        mask_np,
+        m["rho"],
+        save_dir,
+        0)
+    
 
     print("\nEvaluation complete.")
 

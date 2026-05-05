@@ -41,7 +41,7 @@ CHECKPOINT=saved/C3DVAE/model_best.pth
 echo "=== Evaluation ==="
 python evaluate/evaluate.py \
     --checkpoint "$CHECKPOINT" \
-    --num_subjects 20 \
+    --num_subjects 100 \
     --vis_subjects 3 \
     --save_dir eval_results/ \
     --no_mi
@@ -50,7 +50,7 @@ python evaluate/evaluate.py \
 echo "=== Ablations ==="
 python ablation/run_ablations.py \
     --checkpoint   "$CHECKPOINT" \
-    --num_subjects 20 \
+    --num_subjects 100 \
     --ablation     all \
     --save_dir     ablation_results/
 
