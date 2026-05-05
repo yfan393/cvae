@@ -3,7 +3,7 @@
     "seed": 42,
 
     "trainer": {
-        "epochs":      10,
+        "epochs":      50,
         "save_dir":    "saved/C3DVAE/",
         "vis_every":   10,
         "log_every":   10,

@@ -29,7 +29,7 @@ from .loss import CVAELoss
 from utils.model_utils import is_bad
 
 
-CHUNK_SIZE = 53
+CHUNK_SIZE = 32
 
 
 def _forward_chunked(
@@ -252,20 +252,13 @@ class CVAETrainer:
             out = _forward_chunked(self.model, s, c)
             comps = out["components"]
 
-            # Expand the global brain mask to match the current batch size.
-            batch_mask = (
-                self.global_mask.expand(B, -1, -1, -1, -1)
-                if self.global_mask is not None
-                else None
-            )
-
             total, recon, pc, orth, kl_val, _ = self.criterion(
                 smri=s,
                 components=comps,
                 ica_stacked=c,
                 mu=out["mu"],
                 logvar=out["logvar"],
-                mask=batch_mask,
+                mask=None,
                 epoch=epoch,
             )
 
@@ -324,6 +317,7 @@ class CVAETrainer:
         n = 0
         t0 = time.time()
         last_comps = None
+        vis_done = False
 
         assert self.train_smri_mean is not None
 
@@ -339,20 +333,13 @@ class CVAETrainer:
                 out = _forward_chunked(self.model, s, c)
                 comps = out["components"]
 
-                # Expand the global brain mask to match the current batch size.
-                batch_mask = (
-                    self.global_mask.expand(B, -1, -1, -1, -1)
-                    if self.global_mask is not None
-                    else None
-                )
-
                 total, recon, pc, orth, kl_val, rho = self.criterion(
                     smri=s,
                     components=comps,
                     ica_stacked=c,
                     mu=out["mu"],
                     logvar=out["logvar"],
-                    mask=batch_mask,
+                    mask=None,
                     epoch=epoch,
                 )
 
